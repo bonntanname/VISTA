@@ -43,7 +43,7 @@ from tqdm import tqdm
 from vista3d import vista_model_registry
 
 from .sliding_window import sliding_window_inference
-from .train import CONFIG, infer_wrapper, loss_wrapper
+from .train_SimCLR import CONFIG, infer_wrapper, loss_wrapper
 from .utils.workflow_utils import (
     MERGE_LIST,
     generate_prompt_pairs,
