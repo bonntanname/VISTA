@@ -22,7 +22,7 @@ if __name__ == '__main__' and __package__ is None:
     target_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     # カレントディレクトリを変更
     os.chdir(target_dir)
-    output_dir = get_checkpoint_dir("checkpoints","drown")
+    output_dir = get_checkpoint_dir("checkpoints","electrolyte")
     os.makedirs(output_dir)
     log_file_path = os.path.join(output_dir, "output.log")
     logging.basicConfig(
@@ -235,7 +235,7 @@ class get_embed(torch.nn.Module):
         
     def forward(self, input):
         input = self.transform(input)
-        embed = self.encoder(input.to(self.device))
+        embed = self.encoder(input)
         ret = self.final(embed[-1])
         return F.normalize(ret, dim = 1)
 
@@ -413,13 +413,11 @@ def main(base_model, output_dir, num_epochs=1000, batch_size=4, lr=1e-4):
         plt.legend()
         plt.savefig(os.path.join(output_dir, "loss.png"))
         plt.close()
-
 class DrownClassifier(nn.Module):
     def __init__(self, pretrained_model, freeze_backbone=True):
         super(DrownClassifier, self).__init__()
         self.pretrained_model = pretrained_model
         
-        # 事前学習済みモデルの重みを凍結するかどうか
         if freeze_backbone:
             for param in self.pretrained_model.parameters():
                 param.requires_grad = False
@@ -429,54 +427,53 @@ class DrownClassifier(nn.Module):
             nn.Linear(128, 32),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(32, 2),
-            nn.Sigmoid()  # バイナリ分類なのでシグモイド活性化
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        ).to(self.pretrained_model.device)
+
+        # 回帰ヘッドを追加
+        self.regressor = nn.Sequential(
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 1)
         ).to(self.pretrained_model.device)
     
     def forward(self, x):
-        # 特徴抽出（プロジェクションヘッドは使用しない）
         features = self.pretrained_model(x)
-        # 分類
-        output = self.classifier(features)
-        return output.squeeze()  # バッチ次元以外を潰す
+        cls_output = self.classifier(features).squeeze(-1)
+        reg_output = self.regressor(features).squeeze(-1)
+        return cls_output, reg_output
 # CSVからdrownデータを読み込むためのクラス
 class DrownDataset(Dataset):
-    def __init__(self, dir_numbers, drown_labels, device):
-        """
-        Args:
-            dir_numbers (list): dir_number のリスト
-            drown_labels (list): drown ラベルのリスト (0または1)
-            transform (callable, optional): データに適用する変換
-        """
-        assert len(dir_numbers) == len(drown_labels), "dir_numbersとdrown_labelsの長さが一致しません"
-        
+    def __init__(self, dir_numbers, drown_labels, na_values, device):
+        assert len(dir_numbers) == len(drown_labels) == len(na_values)
         self.dir_numbers = dir_numbers
         self.drown_labels = drown_labels
-        
-        # クラス重みを計算
-        from collections import Counter
-        self.class_counts = Counter(drown_labels)
-        print(f"クラス分布: {dict(self.class_counts)}")
+        self.na_values = na_values
         
     def __len__(self):
         return len(self.dir_numbers)
     
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-        
         dir_number = self.dir_numbers[idx]
         drown_label = float(self.drown_labels[idx])
-        
-        # get_cropped_batch関数を使用して画像データを取得
+        na_value = self.na_values[idx]
+
         image = get_cropped_batch_cpu(dir_number,1,1)[0]
-        
-        # テンソルに変換
         image = torch.tensor(image, dtype=torch.float32)
+        
         label = torch.tensor(drown_label, dtype=torch.float32)
         
-        
-        return image, label
+        # drown=0またはNaがNaNの場合はNaNに設定
+        #if drown_label == 0 or np.isnan(na_value):
+        if np.isnan(na_value):
+            na_tensor = torch.tensor(float('nan'), dtype=torch.float32)
+        else:
+            na_tensor = torch.tensor(np.log(na_value + 1e-6), dtype=torch.float32)
+
+        return image, label, na_tensor
+
 # Violin Plotを描画する関数
 def plot_violin(model, val_loader, output_dir, epoch, device='cuda'):
     """検証データのクラスごとの予測確率分布をViolin Plotで可視化する関数"""
@@ -490,9 +487,9 @@ def plot_violin(model, val_loader, output_dir, epoch, device='cuda'):
     
     # 検証セットの予測
     with torch.no_grad():
-        for inputs, labels in val_loader:
+        for inputs, labels, _ in val_loader:
             inputs = inputs.to(device)
-            outputs = model(inputs)
+            outputs, _ = model(inputs)
             
             val_probs.extend(outputs.cpu().numpy())
             val_labels.extend(labels.cpu().numpy())
@@ -534,11 +531,11 @@ def plot_roc_curve(model, data_loader, output_dir, epoch, device='cuda'):
     all_probs = []
     
     with torch.no_grad():
-        for inputs, labels in data_loader:
+        for inputs, labels, _ in data_loader:
             inputs = inputs.to(device)
             labels = labels.to(device)
             
-            outputs = model(inputs)
+            outputs, _ = model(inputs)
             
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(outputs.cpu().numpy())
@@ -563,14 +560,59 @@ def plot_roc_curve(model, data_loader, output_dir, epoch, device='cuda'):
     plt.tight_layout()
     plt.savefig(output_name)
     plt.close()
+def plot_na_scatter(model, data_loader, output_dir, epoch, device='cuda'):
+    """胸水Na濃度の予測値と正解値のScatter Plotをプロットする関数"""
+    scatter_dir = os.path.join(output_dir, "scatter_na")
+    os.makedirs(scatter_dir, exist_ok=True)
+    output_name = os.path.join(scatter_dir, f"scatter_na-{epoch:04d}.png")
+    
+    model.eval()
+    preds = []
+    targets = []
+
+    with torch.no_grad():
+        for images, labels, na_targets in data_loader:
+            images, na_targets = images.to(device), na_targets.to(device)
+            
+            _, reg_outputs = model(images)
+            
+            # 欠損値を除外
+            mask = ~torch.isnan(na_targets)
+            if mask.sum() == 0:
+                continue
+
+            preds.extend(reg_outputs[mask].cpu().numpy())
+            targets.extend(na_targets[mask].cpu().numpy())
+
+    if len(preds) == 0:
+        logging.warning("Scatter plot: No valid Na values found.")
+        return
+
+    # Logスケールから元のスケールに戻す
+    preds_original = np.exp(preds)
+    targets_original = np.exp(targets)
+
+    plt.figure(figsize=(7, 7))
+    plt.scatter(targets_original, preds_original, alpha=0.7, edgecolor='k')
+    plt.plot([targets_original.min(), targets_original.max()],
+             [targets_original.min(), targets_original.max()],
+             'r--', lw=2, label='Ideal')
+    
+    plt.xlabel('True Na Concentration')
+    plt.ylabel('Predicted Na Concentration')
+    plt.title(f'Scatter plot of True vs Predicted Na (Epoch {epoch})')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_name)
+    plt.close()
+
 
 # 学習曲線のプロット
 def plot_training_history(history, output_dir):
     """トレーニング中の損失と精度の履歴をプロットする関数"""
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(5, 4))
     
-    # 損失のプロット
-    plt.subplot(1, 2, 1)
     plt.plot(history['train_loss'], label='Training Loss')
     plt.plot(history['val_loss'], label='Validation Loss')
     plt.title('Loss over epochs')
@@ -578,153 +620,88 @@ def plot_training_history(history, output_dir):
     plt.ylabel('Loss')
     plt.legend()
     
-    # 精度のプロット
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Training Accuracy')
-    plt.plot(history['val_acc'], label='Validation Accuracy')
-    plt.plot(history['val_auc'], label='Validation AUC')
-    plt.title('Metrics over epochs')
-    plt.xlabel('Epoch')
-    plt.ylabel('Score')
-    plt.legend()
-    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir,'training_history.png'))
     plt.close()
+def compute_loss(cls_outputs, reg_outputs, labels, na_targets, device, alpha=1.0, beta=0.1):
+    # 分類損失 (BCE)
+    criterion_cls = nn.BCELoss()
+    loss_cls = criterion_cls(cls_outputs, labels)
+
+    # 回帰損失 (MSE with log)
+    mask = ~torch.isnan(na_targets)
+    if mask.sum() > 0:
+        criterion_reg = nn.MSELoss()
+        loss_reg = criterion_reg(reg_outputs[mask], na_targets[mask])
+    else:
+        loss_reg = torch.tensor(0.0, device=device)
+
+    total_loss = alpha * loss_cls + beta * loss_reg
+    return total_loss, loss_cls.item(), loss_reg.item()
+
 # トレーニングループ
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device='cuda:1'):
-    """
-    モデルのトレーニングと評価を行う関数
-    
-    Args:
-        model: トレーニングするモデル
-        train_loader: トレーニングデータのDataLoader
-        val_loader: 検証データのDataLoader
-        criterion: 損失関数
-        optimizer: オプティマイザ
-        num_epochs: エポック数
-        device: 'cuda'または'cpu'
-    
-    Returns:
-        トレーニング済みのモデルと、トレーニング中の損失と精度の履歴
-    """
-    # 結果を記録するための辞書
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_acc': [],
-        'val_acc': [],
-        'val_auc': []
-    }
-    
-    # デバイスの設定
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+def train_model(model, train_loader, val_loader, optimizer, num_epochs=10, device='cuda:0'):
+    history = {'train_loss': [], 'val_loss': []}
+    device = torch.device(device)
     model = model.to(device)
-    
-    # AUCの計算用
-    from sklearn.metrics import roc_auc_score
-    
+    model = nn.DataParallel(model)
     for epoch in range(num_epochs):
-        
-        # トレーニングフェーズ
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        total_loss = 0.0
         
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            # 勾配をゼロにリセット
+        for images, labels, na_targets in train_loader:
+            images, labels, na_targets = images.to(device), labels.to(device), na_targets.to(device)
+
             optimizer.zero_grad()
-            
-            # フォワードパス
-            outputs = model(inputs)
-            
-            # 損失の計算
-            loss = criterion(outputs, labels)
-            
-            # バックワードパスと最適化
+            cls_outputs, reg_outputs = model(images)
+
+            loss, loss_cls, loss_reg = compute_loss(cls_outputs, reg_outputs, labels, na_targets, device)
             loss.backward()
             optimizer.step()
-            
-            # 統計の更新
-            running_loss += loss.item() * inputs.size(0)
-            predicted = (outputs >= 0.5).float()
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-        
-        epoch_train_loss = running_loss / len(train_loader.dataset)
-        epoch_train_acc = correct / total
-        history['train_loss'].append(epoch_train_loss)
-        history['train_acc'].append(epoch_train_acc)
-        
-        # 検証フェーズ
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        all_outputs = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-                
-                # フォワードパス
-                outputs = model(inputs)
-                
-                # 損失の計算
-                loss = criterion(outputs, labels)
-                
-                # 統計の更新
-                running_loss += loss.item() * inputs.size(0)
-                predicted = (outputs >= 0.5).float()
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-                
-                # AUC計算用にデータを保存
-                all_outputs.extend(outputs.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        epoch_val_loss = running_loss / len(val_loader.dataset)
-        epoch_val_acc = correct / total
-        
-        # AUCの計算
-        try:
-            val_auc = roc_auc_score(all_labels, all_outputs)
-        except:
-            val_auc = 0.5  # エラーが発生した場合のデフォルト値
-            
-        history['val_loss'].append(epoch_val_loss)
-        history['val_acc'].append(epoch_val_acc)
-        history['val_auc'].append(val_auc)
-        
-        logging.info(f'{epoch=}, Train Loss: {epoch_train_loss:.4f} Acc: {epoch_train_acc:.4f}')
-        logging.info(f'{epoch=}, Val Loss: {epoch_val_loss:.4f} Acc: {epoch_val_acc:.4f} AUC: {val_auc:.4f}')
-        plot_training_history(history, output_dir)
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), os.path.join(output_dir,f'model-{epoch:04d}.pth'))
-            plot_roc_curve(model, val_loader, output_dir, epoch, device)
-            plot_violin(model, val_loader, output_dir, epoch, device)
-    
-    return model, history
 
+            total_loss += loss.item() * images.size(0)
+
+        avg_loss = total_loss / len(train_loader.dataset)
+        history['train_loss'].append(avg_loss)
+
+        logging.info(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Cls: {loss_cls:.4f}, Reg: {loss_reg:.4f}')
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, labels, na_targets in val_loader:
+                images, labels, na_targets = images.to(device), labels.to(device), na_targets.to(device)
+                cls_outputs, reg_outputs = model(images)
+                loss, _, _ = compute_loss(cls_outputs, reg_outputs, labels, na_targets, device)
+                val_loss += loss.item() * images.size(0)
+
+        avg_val_loss = val_loss / len(val_loader.dataset)
+        history['val_loss'].append(avg_val_loss)
+
+        logging.info(f'Validation Loss: {avg_val_loss:.4f}')
+        plot_training_history(history, output_dir)
+
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), os.path.join(output_dir, f'model-{epoch:04d}.pth'))
+            plot_roc_curve(model, val_loader, output_dir, epoch, device)  # ROC曲線のプロット
+            plot_violin(model, val_loader, output_dir, epoch, device)     # Violin Plotのプロット
+            plot_na_scatter(model, val_loader, output_dir, epoch, device) # Scatter Plotのプロット
+
+    return model, history
 
 # メイン実行関数
 def main2(output_dir):
     # 設定
-    #pretrained_model_path = '/home/hikari/VISTA/vista3d/checkpoints/SimCLR20250226/model-0770.pth'
-    pretrained_model_path = '/home/hikari/VISTA/vista3d/checkpoints/SimCLR20250308_3/model-0990.pth'
+    pretrained_model_path = '/home/hikari/VISTA/vista3d/checkpoints/SimCLR20250226/model-0770.pth'
+    #pretrained_model_path = '/home/hikari/VISTA/vista3d/checkpoints/SimCLR20250308_3/model-0990.pth'
     csv_file = '/home/hikari/VISTA/vista3d/scripts/lung_weight_with_electrolyte.csv'
-    batch_size = 4
-    num_epochs = 101
+    batch_size = 8
+    num_epochs = 301
     learning_rate = 3 * 1e-4
     
     # デバイスの設定
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     
     # 基盤モデルの作成
@@ -733,6 +710,7 @@ def main2(output_dir):
     # 事前学習済みの重みをロード
     try:
         checkpoint = torch.load(pretrained_model_path, map_location=device)
+        logging.info(f"{checkpoint.keys()=}")
         # チェックポイントがモデルの状態辞書そのものか、状態辞書を含む辞書かによって処理を分ける
         if 'model' in checkpoint:
             self_supervised_model.load_state_dict(checkpoint['model'])
@@ -760,17 +738,17 @@ def main2(output_dir):
     # データセットの作成
     train_df = df[df['dir_number'].isin(lung_weight_data.train)]
     test_df = df[df['dir_number'].isin(lung_weight_data.test)]
-    
-    # トレーニングデータセットとテストデータセットを作成
     train_dataset = DrownDataset(
         dir_numbers=train_df['dir_number'].tolist(),
         drown_labels=train_df['drown'].tolist(),
+        na_values=train_df['average_Na'].tolist(),
         device=device
     )
-    
+
     val_dataset = DrownDataset(
         dir_numbers=test_df['dir_number'].tolist(),
         drown_labels=test_df['drown'].tolist(),
+        na_values=test_df['average_Na'].tolist(),
         device=device
     )
     
@@ -784,7 +762,6 @@ def main2(output_dir):
     
     # 損失関数とオプティマイザの設定
     # 重み付きバイナリクロスエントロピー損失
-    criterion = nn.BCELoss().to(device)  
     
     # オプティマイザの設定
     # 凍結されていない層のみを最適化
@@ -795,7 +772,6 @@ def main2(output_dir):
         classifier, 
         train_loader, 
         val_loader, 
-        criterion, 
         optimizer, 
         num_epochs=num_epochs, 
         device=device
