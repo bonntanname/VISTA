@@ -413,6 +413,8 @@ def main(base_model, output_dir, num_epochs=1000, batch_size=4, lr=1e-4):
         plt.legend()
         plt.savefig(os.path.join(output_dir, "loss.png"))
         plt.close()
+
+
 class DrownClassifier(nn.Module):
     def __init__(self, pretrained_model, freeze_backbone=True):
         super(DrownClassifier, self).__init__()
@@ -466,8 +468,8 @@ class DrownDataset(Dataset):
         label = torch.tensor(drown_label, dtype=torch.float32)
         
         # drown=0またはNaがNaNの場合はNaNに設定
-        #if drown_label == 0 or np.isnan(na_value):
-        if np.isnan(na_value):
+        if drown_label == 0 or np.isnan(na_value):
+        #if np.isnan(na_value):
             na_tensor = torch.tensor(float('nan'), dtype=torch.float32)
         else:
             na_tensor = torch.tensor(np.log(na_value + 1e-6), dtype=torch.float32)
